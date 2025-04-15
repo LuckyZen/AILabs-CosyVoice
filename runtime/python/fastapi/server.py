@@ -15,8 +15,10 @@ import os
 import sys
 import argparse
 import logging
+
+from pydantic import BaseModel
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
-from fastapi import FastAPI, UploadFile, Form, File
+from fastapi import FastAPI, UploadFile, Form, File, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -36,18 +38,47 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"])
 
+class RequestInfo(BaseModel):
+    spk_id: str
+    audio_type: str
+    tts_text: str
 
-def generate_data(model_output):
+def generate_wav_header(sample_rate=24000, bits_per_sample=16, channels=1):
+    # Generate WAV header for the given parameters
+    data_size = 0x7FFF0000  # We'll use a large size since we're streaming
+    o = bytes("RIFF", 'ascii')                                 # (4byte) Marks file as RIFF
+    o += (data_size + 36).to_bytes(4, 'little')               # (4byte) File size in bytes
+    o += bytes("WAVE", 'ascii')                               # (4byte) File type
+    o += bytes("fmt ", 'ascii')                               # (4byte) Format Chunk Marker
+    o += (16).to_bytes(4, 'little')                          # (4byte) Length of above format data
+    o += (1).to_bytes(2, 'little')                           # (2byte) Format type (1 - PCM)
+    o += (channels).to_bytes(2, 'little')                    # (2byte) Number of channels
+    o += (sample_rate).to_bytes(4, 'little')                 # (4byte) Sample Rate
+    o += (sample_rate * channels * bits_per_sample // 8).to_bytes(4, 'little')  # (4byte) Bytes per second
+    o += (channels * bits_per_sample // 8).to_bytes(2, 'little')               # (2byte) Block alignment
+    o += (bits_per_sample).to_bytes(2, 'little')            # (2byte) Bits per sample
+    o += bytes("data", 'ascii')                              # (4byte) Data Chunk Marker
+    o += (data_size).to_bytes(4, 'little')                  # (4byte) Data size in bytes
+    return o
+
+def generate_data(model_output, audio_type='pcm'):
+    if audio_type == 'wav':
+        yield generate_wav_header()
     for i in model_output:
         tts_audio = (i['tts_speech'].numpy() * (2 ** 15)).astype(np.int16).tobytes()
         yield tts_audio
 
 
-@app.get("/inference_sft")
 @app.post("/inference_sft")
-async def inference_sft(tts_text: str = Form(), spk_id: str = Form()):
-    model_output = cosyvoice.inference_sft(tts_text, spk_id)
-    return StreamingResponse(generate_data(model_output))
+async def inference_sft(req: RequestInfo):
+    model_output = cosyvoice.inference_zero_shot(req.tts_text, None, None, zero_shot_spk_id=req.spk_id, stream=True)
+    return StreamingResponse(generate_data(model_output, req.audio_type), media_type='audio/' + req.audio_type)
+
+
+@app.get("/inference_sft")
+async def inference_sft(tts_text: str = Query(), spk_id: str = Query(), audio_type: str = Query('wav')):
+    model_output = cosyvoice.inference_zero_shot(tts_text, None, None, zero_shot_spk_id=spk_id, stream=True)
+    return StreamingResponse(generate_data(model_output, audio_type), media_type='audio/' + audio_type)
 
 
 @app.get("/inference_zero_shot")
@@ -85,17 +116,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port',
                         type=int,
-                        default=50000)
+                        default=9881)
     parser.add_argument('--model_dir',
                         type=str,
-                        default='iic/CosyVoice-300M',
+                        default='pretrained_models/CosyVoice2-0.5B',
                         help='local path or modelscope repo id')
     args = parser.parse_args()
     try:
         cosyvoice = CosyVoice(args.model_dir)
     except Exception:
         try:
-            cosyvoice = CosyVoice2(args.model_dir)
+            cosyvoice = CosyVoice2(args.model_dir, True, True, False, True)
         except Exception:
             raise TypeError('no valid model_type!')
     uvicorn.run(app, host="0.0.0.0", port=args.port)
